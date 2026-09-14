@@ -5,9 +5,11 @@ package store_test
 // This is the test the whole claim mechanism exists to justify: it proves
 // that FOR UPDATE SKIP LOCKED does what internal/store/jobs.go's comment
 // claims it does under real concurrency, against a real Postgres instance
-// (via testcontainers), not a mock. Run with:
+// (via testcontainers), not a mock. A single pass proves little on its own
+// against a scheduler-timing-dependent race - run it repeated and with the
+// race detector on the Go-side harness before trusting it:
 //
-//	go test -tags=integration ./internal/store/...
+//	go test -tags=integration -race -count=20 ./internal/store/... ./internal/queue/...
 
 import (
 	"context"
@@ -47,12 +49,23 @@ func startPostgres(t *testing.T, ctx context.Context) string {
 	return connStr
 }
 
-// TestClaimJobsNoDoubleClaim enqueues 100 jobs and runs 4 claimers
-// concurrently against the same table, each repeatedly pulling batches of 5
+// TestClaimJobsNoDoubleClaim enqueues 1000 jobs and runs 16 claimers
+// concurrently against the same table, each repeatedly pulling batches of 13
 // until the queue is empty. It asserts every job is claimed by exactly one
 // claimer - the property SKIP LOCKED exists to guarantee.
+//
+// Batch size > 1 matters here: a single-row claim (LIMIT 1) is hard to get
+// wrong even with a naive query, because there's only ever one row in
+// flight per transaction. Multi-row batches are where a bad claim query
+// (e.g. missing SKIP LOCKED, or a claim/mark-running step split across two
+// statements) shows up, because two claimers can each walk away thinking
+// they own an overlapping slice of the table.
+//
+// A single run only has so much power to catch a race - see the -race
+// -count=N invocation documented at the top of this file for how this is
+// actually exercised.
 func TestClaimJobsNoDoubleClaim(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	connStr := startPostgres(t, ctx)
@@ -63,23 +76,22 @@ func TestClaimJobsNoDoubleClaim(t *testing.T) {
 	defer s.Close()
 
 	const (
-		totalJobs   = 100
-		numClaimers = 4
-		claimBatch  = 5
+		totalJobs   = 1000
+		numClaimers = 16
+		claimBatch  = 13
 		queueName   = "loadtest"
 	)
 
-	for i := 0; i < totalJobs; i++ {
-		_, err := s.InsertJob(ctx, store.InsertJobParams{
-			Queue:       queueName,
-			JobType:     "sleep",
-			Payload:     []byte(`{}`),
-			Priority:    0,
-			RunAt:       time.Now(),
-			MaxAttempts: 5,
-		})
-		require.NoError(t, err)
-	}
+	// A single INSERT...SELECT over generate_series is one round trip for
+	// all 1000 rows, instead of 1000 - this keeps -count=20 runs fast
+	// enough to actually use in a tight feedback loop.
+	_, err = s.Pool().Exec(ctx, `
+		INSERT INTO jobs (queue, job_type, payload, priority, run_at, max_attempts)
+		SELECT $1, 'sleep', '{}'::jsonb, 0, now(), 5
+		FROM generate_series(1, $2)`,
+		queueName, totalJobs,
+	)
+	require.NoError(t, err)
 
 	var (
 		mu       sync.Mutex
