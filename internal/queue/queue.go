@@ -7,6 +7,9 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -14,16 +17,30 @@ import (
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
-var ErrNotFound = store.ErrNotFound
+var (
+	ErrNotFound      = store.ErrNotFound
+	ErrStaleClaim    = store.ErrStaleClaim
+	ErrNotReplayable = store.ErrNotReplayable
+)
 
 const DefaultMaxAttempts = 5
 
 type Queue struct {
 	store *store.Store
+
+	// rngMu guards rng: math/rand's *rand.Rand is not safe for concurrent
+	// use (unlike the deprecated top-level package functions), and Fail is
+	// reachable from multiple worker goroutines once the worker pool gains
+	// concurrency.
+	rngMu sync.Mutex
+	rng   *rand.Rand
 }
 
 func New(s *store.Store) *Queue {
-	return &Queue{store: s}
+	return &Queue{
+		store: s,
+		rng:   rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
 type EnqueueParams struct {
@@ -70,10 +87,49 @@ func (q *Queue) Claim(ctx context.Context, queueName string, limit int, workerID
 	return q.store.ClaimJobs(ctx, queueName, limit, workerID)
 }
 
-func (q *Queue) Complete(ctx context.Context, id pgtype.UUID) error {
-	return q.store.CompleteJob(ctx, id)
+// Complete marks a claimed job succeeded. job must be a row returned by
+// Claim - its ClaimedBy is used as the fencing token, so a worker that has
+// since had its claim reclaimed by the reaper writes nothing instead of
+// clobbering a newer attempt. See store.ErrStaleClaim.
+func (q *Queue) Complete(ctx context.Context, job *store.Job) error {
+	claimedBy, err := claimant(job)
+	if err != nil {
+		return err
+	}
+	return q.store.CompleteJob(ctx, job.ID, claimedBy)
 }
 
-func (q *Queue) Fail(ctx context.Context, id pgtype.UUID, cause string) error {
-	return q.store.FailJob(ctx, id, cause)
+// Fail records that a claimed job's handler returned cause, and decides
+// whether it gets another attempt or is dead-lettered. job must be a row
+// returned by Claim: its Attempts (already incremented by the claim) and
+// MaxAttempts decide the outcome, and its ClaimedBy is the fencing token
+// for the write - see Complete and store.ErrStaleClaim.
+func (q *Queue) Fail(ctx context.Context, job *store.Job, cause error) error {
+	claimedBy, err := claimant(job)
+	if err != nil {
+		return err
+	}
+
+	if job.Attempts >= job.MaxAttempts {
+		return q.store.MarkDead(ctx, job.ID, claimedBy, cause.Error())
+	}
+
+	q.rngMu.Lock()
+	delay := Backoff(int(job.Attempts), q.rng)
+	q.rngMu.Unlock()
+
+	return q.store.MarkFailedForRetry(ctx, job.ID, claimedBy, cause.Error(), time.Now().Add(delay))
+}
+
+func claimant(job *store.Job) (string, error) {
+	if job.ClaimedBy == nil {
+		return "", fmt.Errorf("queue: job %s has no claimant - it did not come from Claim", job.ID.String())
+	}
+	return *job.ClaimedBy, nil
+}
+
+// Replay requeues a dead job. See store.ReplayJob for the exact reset and
+// ErrNotFound/ErrNotReplayable for why it can fail.
+func (q *Queue) Replay(ctx context.Context, id pgtype.UUID) (*store.Job, error) {
+	return q.store.ReplayJob(ctx, id)
 }
