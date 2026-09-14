@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -63,13 +64,25 @@ func (w *Worker) execute(ctx context.Context, job *store.Job) {
 		return
 	}
 
-	if err := w.queue.Complete(ctx, job.ID); err != nil {
-		log.Printf("worker: mark job %s succeeded: %v", job.ID.String(), err)
+	if err := w.queue.Complete(ctx, job); err != nil {
+		logTerminalWriteErr(job.ID.String(), "succeeded", err)
 	}
 }
 
 func (w *Worker) fail(ctx context.Context, job *store.Job, cause error) {
-	if err := w.queue.Fail(ctx, job.ID, cause.Error()); err != nil {
-		log.Printf("worker: mark job %s failed: %v", job.ID.String(), err)
+	if err := w.queue.Fail(ctx, job, cause); err != nil {
+		logTerminalWriteErr(job.ID.String(), "failed", err)
 	}
+}
+
+// logTerminalWriteErr distinguishes the expected case - the reaper already
+// reclaimed this job out from under a worker that took too long to report
+// back, so its own completion/failure write is stale by design - from a
+// genuine unexpected error.
+func logTerminalWriteErr(jobID, outcome string, err error) {
+	if errors.Is(err, queue.ErrStaleClaim) {
+		log.Printf("worker: job %s reported %s but its claim was already reclaimed; discarding this attempt's result", jobID, outcome)
+		return
+	}
+	log.Printf("worker: mark job %s %s: %v", jobID, outcome, err)
 }
