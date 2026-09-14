@@ -121,6 +121,18 @@ func (q *Queue) Fail(ctx context.Context, job *store.Job, cause error) error {
 	return q.store.MarkFailedForRetry(ctx, job.ID, claimedBy, cause.Error(), time.Now().Add(delay))
 }
 
+// Release hands a claimed job back immediately, without charging it an
+// attempt or a backoff delay - for an orderly worker shutdown giving back
+// work it didn't get to, not a reported failure. job must be a row
+// returned by Claim; see Complete for the fencing behavior on ClaimedBy.
+func (q *Queue) Release(ctx context.Context, job *store.Job) error {
+	claimedBy, err := claimant(job)
+	if err != nil {
+		return err
+	}
+	return q.store.ReleaseJob(ctx, job.ID, claimedBy)
+}
+
 func claimant(job *store.Job) (string, error) {
 	if job.ClaimedBy == nil {
 		return "", fmt.Errorf("queue: job %s has no claimant - it did not come from Claim", job.ID.String())
