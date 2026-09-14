@@ -45,6 +45,13 @@ const jobColumns = `id, queue, job_type, payload, status, priority, run_at,
 	attempts, max_attempts, last_error, idempotency_key, claimed_by,
 	claimed_at, created_at, updated_at`
 
+// jobsTableColumns is jobColumns qualified with the jobs. table prefix, for
+// statements that join jobs against another relation in scope (the claimed
+// CTE below) where an unqualified column list would be ambiguous.
+const jobsTableColumns = `jobs.id, jobs.queue, jobs.job_type, jobs.payload, jobs.status, jobs.priority, jobs.run_at,
+	jobs.attempts, jobs.max_attempts, jobs.last_error, jobs.idempotency_key, jobs.claimed_by,
+	jobs.claimed_at, jobs.created_at, jobs.updated_at`
+
 func scanJob(row pgx.Row) (*Job, error) {
 	var j Job
 	err := row.Scan(
@@ -129,7 +136,7 @@ func (s *Store) ClaimJobs(ctx context.Context, queue string, limit int, workerID
 			updated_at = now()
 		FROM claimed
 		WHERE jobs.id = claimed.id
-		RETURNING `+jobColumns,
+		RETURNING `+jobsTableColumns,
 		queue, limit, workerID,
 	)
 	if err != nil {
