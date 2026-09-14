@@ -226,6 +226,34 @@ func (s *Store) MarkDead(ctx context.Context, id pgtype.UUID, claimedBy, cause s
 	return nil
 }
 
+// ReleaseJob returns a running job to pending immediately (run_at = now()),
+// but only if claimedBy still matches the row's claimed_by. See
+// ErrStaleClaim.
+//
+// Unlike MarkFailedForRetry, attempts is left untouched: this isn't a
+// reported failure or a suspected-dead reclaim, it's an orderly worker
+// shutdown voluntarily giving back work it simply didn't get to. The job
+// shouldn't be charged an attempt, and it shouldn't wait out a backoff
+// window either - some other worker is very likely still healthy and
+// idle, so making the job immediately claimable again is strictly better
+// than making it wait.
+func (s *Store) ReleaseJob(ctx context.Context, id pgtype.UUID, claimedBy string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'pending', run_at = now(),
+			claimed_by = NULL, claimed_at = NULL, updated_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		id, claimedBy,
+	)
+	if err != nil {
+		return fmt.Errorf("store: release job: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrStaleClaim
+	}
+	return nil
+}
+
 // MarkFailedForRetry returns a running job to pending with a future run_at,
 // but only if claimedBy still matches the row's claimed_by. See
 // ErrStaleClaim. The retry delay (runAt) is computed by the caller -
