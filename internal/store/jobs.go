@@ -78,10 +78,28 @@ type InsertJobParams struct {
 	IdempotencyKey *string
 }
 
+// InsertJob enqueues a job. If IdempotencyKey is set and a job with the
+// same (queue, idempotency_key) already exists, the existing row is
+// returned instead of creating a duplicate.
+//
+// This is one statement rather than an insert-then-fetch-on-conflict,
+// because a two-step version is only correct under READ COMMITTED: the
+// fetch would rely on seeing a row committed by a concurrent transaction
+// after this transaction's own insert returned nothing, which a
+// REPEATABLE READ (or stricter) transaction's snapshot would not see,
+// silently returning "no job" instead of the real one. ON CONFLICT ...
+// DO UPDATE ... RETURNING has no such window: Postgres resolves the
+// conflict and returns the winning row within the same statement,
+// regardless of isolation level. The DO UPDATE itself is a genuine no-op
+// (updated_at is set to its own current value) - it exists only because
+// RETURNING requires a matching DO UPDATE; ON CONFLICT DO NOTHING returns
+// no row at all on a conflict.
 func (s *Store) InsertJob(ctx context.Context, p InsertJobParams) (*Job, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO jobs (queue, job_type, payload, priority, run_at, max_attempts, idempotency_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL
+		DO UPDATE SET updated_at = jobs.updated_at
 		RETURNING `+jobColumns,
 		p.Queue, p.JobType, p.Payload, p.Priority, p.RunAt, p.MaxAttempts, p.IdempotencyKey,
 	)
@@ -158,28 +176,74 @@ func (s *Store) ClaimJobs(ctx context.Context, queue string, limit int, workerID
 	return jobs, nil
 }
 
-func (s *Store) CompleteJob(ctx context.Context, id pgtype.UUID) error {
+// ErrStaleClaim is returned when a terminal write (complete, mark dead, or
+// mark failed-for-retry) targets a job that is no longer held by the given
+// claimant. That happens when the reaper has already reclaimed the job out
+// from under a worker that is still alive but stuck (a GC pause, a slow
+// network call - not necessarily a crash) and a different claimant now
+// owns it, or has already moved it to a different terminal state.
+//
+// Every terminal write is fenced with `WHERE claimed_by = $claimant`
+// precisely so this can happen safely: the original worker's write affects
+// zero rows instead of overwriting whatever the new claimant did. Callers
+// that get this error must not retry the write - the row already reflects
+// a different attempt's outcome.
+var ErrStaleClaim = errors.New("store: claim is no longer held")
+
+// CompleteJob marks a running job succeeded, but only if claimedBy still
+// matches the row's claimed_by. See ErrStaleClaim.
+func (s *Store) CompleteJob(ctx context.Context, id pgtype.UUID, claimedBy string) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE jobs SET status = 'succeeded', updated_at = now() WHERE id = $1`, id)
+		UPDATE jobs
+		SET status = 'succeeded', updated_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		id, claimedBy,
+	)
 	if err != nil {
 		return fmt.Errorf("store: complete job: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return ErrStaleClaim
 	}
 	return nil
 }
 
-func (s *Store) FailJob(ctx context.Context, id pgtype.UUID, cause string) error {
+// MarkDead moves a running job straight to the dead-letter state, but only
+// if claimedBy still matches the row's claimed_by. See ErrStaleClaim.
+func (s *Store) MarkDead(ctx context.Context, id pgtype.UUID, claimedBy, cause string) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE jobs SET status = 'failed', last_error = $2, updated_at = now() WHERE id = $1`,
-		id, cause,
+		UPDATE jobs
+		SET status = 'dead', last_error = $3, claimed_by = NULL, claimed_at = NULL, updated_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		id, claimedBy, cause,
 	)
 	if err != nil {
-		return fmt.Errorf("store: fail job: %w", err)
+		return fmt.Errorf("store: mark dead: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return ErrStaleClaim
+	}
+	return nil
+}
+
+// MarkFailedForRetry returns a running job to pending with a future run_at,
+// but only if claimedBy still matches the row's claimed_by. See
+// ErrStaleClaim. The retry delay (runAt) is computed by the caller -
+// queue.Backoff - since it needs the job's already-known attempts count,
+// which the claim step already returned.
+func (s *Store) MarkFailedForRetry(ctx context.Context, id pgtype.UUID, claimedBy, cause string, runAt time.Time) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'pending', last_error = $3, run_at = $4,
+			claimed_by = NULL, claimed_at = NULL, updated_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		id, claimedBy, cause, runAt,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark failed for retry: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrStaleClaim
 	}
 	return nil
 }
