@@ -37,7 +37,7 @@ func (s *Store) ReclaimStale(ctx context.Context, threshold time.Time, limit int
 		UPDATE jobs
 		SET
 			attempts = jobs.attempts + 1,
-			status = CASE WHEN jobs.attempts + 1 >= jobs.max_attempts THEN 'dead' ELSE 'pending' END,
+			status = CASE WHEN jobs.attempts + 1 >= jobs.max_attempts THEN 'dead'::job_status ELSE 'pending'::job_status END,
 			last_error = CASE WHEN jobs.attempts + 1 >= jobs.max_attempts
 				THEN 'reaper: exceeded max_attempts after reclaiming an abandoned claim'
 				ELSE 'reaper: reclaimed an abandoned claim (visibility timeout exceeded)'
