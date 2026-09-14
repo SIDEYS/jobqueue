@@ -115,3 +115,31 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, toJobResponse(job))
 }
+
+func (a *API) replayJob(w http.ResponseWriter, r *http.Request) {
+	idParam := chi.URLParam(r, "id")
+
+	var id pgtype.UUID
+	if err := id.Scan(idParam); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+
+	job, err := a.queue.Replay(r.Context(), id)
+	switch {
+	case errors.Is(err, queue.ErrNotFound):
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	case errors.Is(err, queue.ErrNotReplayable):
+		// Replaying anything but a dead job would race a live execution
+		// (or a job still legitimately waiting its turn), so this is a
+		// conflict with the job's current state, not a bad request.
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toJobResponse(job))
+}
