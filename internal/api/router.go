@@ -36,6 +36,7 @@ func NewRouter(q *queue.Queue, s *store.Store, hub *events.Hub, log *slog.Logger
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/jobs", a.enqueueJob)
+		r.Get("/jobs", a.listJobs)
 		r.Get("/jobs/{id}", a.getJob)
 		r.Post("/jobs/{id}/replay", a.replayJob)
 		r.Get("/events", a.events)
