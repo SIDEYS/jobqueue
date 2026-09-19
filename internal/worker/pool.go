@@ -91,9 +91,22 @@ func (p *Pool) Run(ctx context.Context) error {
 			batch = capacity
 		}
 
+		// A claim error - a dropped connection, a Postgres restart - is
+		// treated the same as an empty result: log it and back off, rather
+		// than exiting the process. pgxpool reconnects transparently on its
+		// own, and every other long-running loop in this codebase (the
+		// reaper, the heartbeater, the scheduler's leader connection) already
+		// survives a transient DB blip instead of dying to it; a worker
+		// shouldn't be the one process that takes the whole pod down over a
+		// database restart that resolves itself in a few seconds.
 		jobs, err := p.queue.Claim(ctx, p.cfg.QueueName, batch, p.cfg.WorkerID)
 		if err != nil {
-			return fmt.Errorf("worker: claim: %w", err)
+			p.log.Error("worker: claim failed, retrying", "error", err)
+			emptyStreak++
+			if !p.wait(ctx, pollInterval(emptyStreak, p.cfg.PollBase, p.cfg.PollMax)) {
+				return nil
+			}
+			continue
 		}
 
 		if len(jobs) == 0 {

@@ -142,3 +142,62 @@ func TestPoolShutdownReleasesInFlightJob(t *testing.T) {
 	require.Equal(t, store.StatusSucceeded, final.Status)
 	require.Equal(t, *claimedByB[0].ClaimedBy, *final.ClaimedBy, "B's completion must be what survives, not a stale write from A")
 }
+
+// TestPoolSurvivesTransientClaimError proves a claim error - a dropped
+// connection, a database restart - gets logged and retried, not treated as
+// fatal. Closing the pool out from under Run is a fast, deterministic stand-in
+// for a real connection drop: every subsequent Claim fails immediately with
+// "closed pool", exactly like a live database blip would surface once
+// pgxpool's own dial retries are exhausted. Before this test's underlying
+// fix, that error propagated straight out of Run and the process exited -
+// making a worker the one long-running loop in this codebase that died to a
+// transient DB error instead of riding it out, unlike the reaper, the
+// heartbeater, and the scheduler's leader connection.
+func TestPoolSurvivesTransientClaimError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	connStr := startPostgres(t, ctx)
+	require.NoError(t, store.Migrate(connStr))
+
+	s, err := store.New(ctx, connStr)
+	require.NoError(t, err)
+
+	q := queue.New(s)
+	reg := worker.NewRegistry()
+
+	pool := worker.NewPool(q, reg, worker.Config{
+		QueueName:   "claim-error-test",
+		WorkerID:    "pool-a",
+		Concurrency: 1,
+		BatchSize:   1,
+		PollBase:    20 * time.Millisecond,
+		PollMax:     50 * time.Millisecond,
+		JobTimeout:  time.Second,
+	}, nil)
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- pool.Run(runCtx) }()
+
+	// Force every subsequent Claim to fail immediately.
+	s.Close()
+
+	// Run must keep looping through repeated claim errors, not exit on the
+	// first one.
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run exited on a claim error instead of retrying it (err=%v)", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// It must still be responsive to cancellation once the error condition
+	// isn't fatal on its own.
+	runCancel()
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after context cancellation")
+	}
+}
