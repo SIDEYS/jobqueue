@@ -4,9 +4,9 @@
 // orchestration-layer concern, decided by queue/worker/reaper/scheduler
 // code that already knows what actually happened, not something bolted
 // onto the raw persistence layer. The live-query collectors in
-// collectors.go are the one exception - they need to read current state
-// directly, and live in this package too, but as the only file here that
-// imports internal/store.
+// collectors.go are the one exception - queue depth and active worker
+// count aren't events to record, they're read fresh on every scrape, so
+// that file talks to pgxpool directly.
 package metrics
 
 import (
