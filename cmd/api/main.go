@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,18 +14,21 @@ import (
 
 	"github.com/SIDEYS/jobqueue/internal/api"
 	"github.com/SIDEYS/jobqueue/internal/events"
+	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/queue"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+	log := logging.New(getenv("LOG_LEVEL", "info"))
+	if err := run(log); err != nil {
+		log.Error("api: fatal", "error", err)
+		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(log *slog.Logger) error {
 	dbURL := getenv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5432/jobqueue?sslmode=disable")
 	addr := getenv("API_ADDR", ":8080")
 
@@ -50,9 +53,9 @@ func run() error {
 	q := queue.New(s)
 	hub := events.NewHub()
 	defer hub.Close()
-	listener := events.NewListener(s.Pool(), hub, nil)
+	listener := events.NewListener(s.Pool(), hub, log)
 
-	router := api.NewRouter(q, hub)
+	router := api.NewRouter(q, hub, log)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -62,7 +65,7 @@ func run() error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		log.Printf("api: listening on %s", addr)
+		log.Info("api: listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -78,7 +81,7 @@ func run() error {
 	case err := <-errCh:
 		return err
 	case <-sigCh:
-		log.Print("api: shutting down")
+		log.Info("api: shutting down")
 		cancelListener()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()

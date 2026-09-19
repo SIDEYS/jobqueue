@@ -3,6 +3,7 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -10,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/SIDEYS/jobqueue/internal/events"
+	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/queue"
 )
 
@@ -18,12 +20,13 @@ type API struct {
 	hub   *events.Hub
 }
 
-func NewRouter(q *queue.Queue, hub *events.Hub) http.Handler {
+func NewRouter(q *queue.Queue, hub *events.Hub, log *slog.Logger) http.Handler {
 	a := &API{queue: q, hub: hub}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Logger)
+	r.Use(middleware.RequestID)
+	r.Use(logging.Middleware(log))
 
 	r.Handle("/metrics", promhttp.Handler())
 
