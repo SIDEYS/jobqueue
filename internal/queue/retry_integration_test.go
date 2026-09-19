@@ -57,7 +57,7 @@ func TestFailRetriesThenDeadLetters(t *testing.T) {
 
 	q := queue.New(s)
 
-	inserted, err := q.Enqueue(ctx, queue.EnqueueParams{
+	job, _, err := q.Enqueue(ctx, queue.EnqueueParams{
 		Queue:       "retry-test",
 		JobType:     "sleep",
 		Payload:     []byte(`{}`),
@@ -68,7 +68,7 @@ func TestFailRetriesThenDeadLetters(t *testing.T) {
 	for attempt := int32(1); attempt <= 2; attempt++ {
 		// Backoff pushes run_at into the future; force it claimable now so
 		// the test doesn't wait out real backoff delays.
-		_, err = s.Pool().Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, inserted.ID)
+		_, err = s.Pool().Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, job.ID)
 		require.NoError(t, err)
 
 		claimed, err := q.Claim(ctx, "retry-test", 1, "worker")
@@ -78,13 +78,13 @@ func TestFailRetriesThenDeadLetters(t *testing.T) {
 
 		require.NoError(t, q.Fail(ctx, claimed[0], errors.New("boom")))
 
-		after, err := q.Get(ctx, inserted.ID)
+		after, err := q.Get(ctx, job.ID)
 		require.NoError(t, err)
 		require.Equalf(t, store.StatusPending, after.Status, "attempt %d of 3 should retry, not dead-letter", attempt)
 	}
 
 	// Third and final attempt: max_attempts is exhausted, this must dead-letter.
-	_, err = s.Pool().Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, inserted.ID)
+	_, err = s.Pool().Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, job.ID)
 	require.NoError(t, err)
 
 	claimed, err := q.Claim(ctx, "retry-test", 1, "worker")
@@ -94,7 +94,7 @@ func TestFailRetriesThenDeadLetters(t *testing.T) {
 
 	require.NoError(t, q.Fail(ctx, claimed[0], errors.New("boom final")))
 
-	final, err := q.Get(ctx, inserted.ID)
+	final, err := q.Get(ctx, job.ID)
 	require.NoError(t, err)
 	require.Equal(t, store.StatusDead, final.Status)
 	require.Equal(t, int32(3), final.Attempts)

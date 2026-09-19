@@ -84,7 +84,7 @@ func TestPoolShutdownReleasesInFlightJob(t *testing.T) {
 		JobTimeout:  time.Minute, // long enough not to fire during this test
 	})
 
-	inserted, err := q.Enqueue(ctx, queue.EnqueueParams{
+	inserted, _, err := q.Enqueue(ctx, queue.EnqueueParams{
 		Queue: "shutdown-test", JobType: "blocking", Payload: []byte(`{}`), MaxAttempts: 5,
 	})
 	require.NoError(t, err)

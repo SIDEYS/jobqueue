@@ -47,7 +47,7 @@ func TestIdempotentEnqueueUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			job, err := s.InsertJob(ctx, store.InsertJobParams{
+			job, _, err := s.InsertJob(ctx, store.InsertJobParams{
 				Queue:          queueName,
 				JobType:        "charge",
 				Payload:        []byte(`{}`),
@@ -115,13 +115,13 @@ func TestReclaimStaleRetriesOrDeadLettersBasedOnAttempts(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	retryable, err := s.InsertJob(ctx, store.InsertJobParams{
+	retryable, _, err := s.InsertJob(ctx, store.InsertJobParams{
 		Queue: "reap", JobType: "sleep", Payload: []byte(`{}`), RunAt: time.Now(), MaxAttempts: 3,
 	})
 	require.NoError(t, err)
 	backdateAsStaleClaim(t, ctx, s, retryable.ID, "zombie-a", 1) // 1 of 3 attempts used
 
-	exhausted, err := s.InsertJob(ctx, store.InsertJobParams{
+	exhausted, _, err := s.InsertJob(ctx, store.InsertJobParams{
 		Queue: "reap", JobType: "sleep", Payload: []byte(`{}`), RunAt: time.Now(), MaxAttempts: 2,
 	})
 	require.NoError(t, err)
@@ -169,7 +169,7 @@ func TestZombieWriterFencing(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	inserted, err := s.InsertJob(ctx, store.InsertJobParams{
+	inserted, _, err := s.InsertJob(ctx, store.InsertJobParams{
 		Queue: "zombie", JobType: "sleep", Payload: []byte(`{}`), RunAt: time.Now(), MaxAttempts: 5,
 	})
 	require.NoError(t, err)

@@ -53,12 +53,16 @@ type EnqueueParams struct {
 	IdempotencyKey *string
 }
 
-func (q *Queue) Enqueue(ctx context.Context, p EnqueueParams) (*store.Job, error) {
+// Enqueue creates a job, or - if IdempotencyKey names an existing job in
+// the same queue - returns that job instead. inserted reports which one
+// happened, so callers (metrics in particular) don't count an idempotent
+// replay as a new job.
+func (q *Queue) Enqueue(ctx context.Context, p EnqueueParams) (job *store.Job, inserted bool, err error) {
 	if p.Queue == "" {
-		return nil, errors.New("queue: queue name is required")
+		return nil, false, errors.New("queue: queue name is required")
 	}
 	if p.JobType == "" {
-		return nil, errors.New("queue: job_type is required")
+		return nil, false, errors.New("queue: job_type is required")
 	}
 	if p.RunAt.IsZero() {
 		p.RunAt = time.Now()

@@ -50,7 +50,7 @@ func TestPoolJobTimeoutFailsThenDeadLetters(t *testing.T) {
 		JobTimeout:  200 * time.Millisecond,
 	})
 
-	inserted, err := q.Enqueue(ctx, queue.EnqueueParams{
+	inserted, _, err := q.Enqueue(ctx, queue.EnqueueParams{
 		Queue: "timeout-test", JobType: "hang", Payload: []byte(`{}`), MaxAttempts: 2,
 	})
 	require.NoError(t, err)

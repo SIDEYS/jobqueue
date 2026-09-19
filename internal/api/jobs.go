@@ -85,13 +85,21 @@ func (a *API) enqueueJob(w http.ResponseWriter, r *http.Request) {
 		params.RunAt = *req.RunAt
 	}
 
-	job, err := a.queue.Enqueue(r.Context(), params)
+	job, inserted, err := a.queue.Enqueue(r.Context(), params)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toJobResponse(job))
+	// 200 for an idempotent replay (nothing new was created), 201 for a
+	// genuine new job - now that Enqueue reports which one happened, the
+	// status code can say so instead of always claiming to have created
+	// something.
+	status := http.StatusOK
+	if inserted {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, toJobResponse(job))
 }
 
 func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
