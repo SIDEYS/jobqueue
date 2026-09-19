@@ -13,8 +13,11 @@ import (
 )
 
 // parser accepts the standard 5-field cron format (minute hour dom month
-// dow).
-var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+// dow) and, with an optional leading seconds field, 6-field expressions
+// down to per-second granularity (e.g. "*/30 * * * * *"). Omitting the
+// seconds field defaults it to 0, so every standard crontab expression
+// still means exactly what it always has.
+var parser = cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 // NextRun returns the next time expr fires strictly after 'after'.
 //

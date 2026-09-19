@@ -32,6 +32,13 @@ func TestNextRunIsAlwaysStrictlyAfterReference(t *testing.T) {
 	require.Equal(t, time.Date(2026, 3, 1, 13, 50, 0, 0, time.UTC), next)
 }
 
+func TestNextRunAcceptsOptionalSecondsField(t *testing.T) {
+	after := time.Date(2026, 3, 1, 13, 45, 1, 0, time.UTC)
+	next, err := NextRun("*/2 * * * * *", after)
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 3, 1, 13, 45, 2, 0, time.UTC), next)
+}
+
 func TestNextRunInvalidExpression(t *testing.T) {
 	_, err := NextRun("not a cron expression", time.Now())
 	require.Error(t, err)
