@@ -89,13 +89,13 @@ up" mechanism. This isn't a bug to fix; it's inherent to a fan-out
 pub/sub built on `NOTIFY`, which itself makes no delivery guarantee to a
 listener that wasn't listening at the time.
 
-The correct way to consume this stream, and the only way the dashboard
-(Phase 6) is built to use it: **fetch current state first, then treat
-each event as a signal to refetch, not as the update itself.** On
-connect, call the normal REST endpoints (`GET /api/v1/jobs`, `GET
-/api/v1/queues`, etc.) to get a real snapshot. After that, an incoming
-event means "something changed for this job/queue - go re-fetch it if
-you care," not "here is the new state, apply it directly." A client that
-treats the stream as authoritative will drift silently out of sync with
-reality the first time it misses an event, and have no way to know it
-happened.
+The correct way to consume this stream, and the way the dashboard
+(`web/`, see its `useJobEvents`/`sseReducer`) actually uses it: **fetch
+current state first, then treat each event as a signal to refetch, not as
+the update itself.** On connect, call the normal REST endpoints (`GET
+/api/v1/jobs`, `GET /api/v1/queues`, etc.) to get a real snapshot. After
+that, an incoming event means "something changed for this job/queue - go
+re-fetch it if you care," not "here is the new state, apply it directly."
+A client that treats the stream as authoritative will drift silently out
+of sync with reality the first time it misses an event, and have no way
+to know it happened.

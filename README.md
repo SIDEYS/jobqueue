@@ -95,6 +95,50 @@ why, and for a subtle failure mode (a connection that still holds the
 lock leaking it into the pool) worth understanding before touching
 `internal/scheduler/leader.go`.
 
+## Dashboard
+
+`web/` is a Vite + React + TypeScript app (Tailwind, TanStack Query,
+Recharts) that gives the API surface a face: an overview of status counts,
+queue depth, and throughput; a filterable job list that doubles as the
+dead-letter queue view (`?status=dead` plus a per-row replay button); a form
+to submit `sleep`/`flaky` demo jobs directly; and full CRUD on schedules.
+
+```
+cd web
+npm install
+npm run dev
+```
+
+The dev server proxies `/api/*` to `cmd/api` on `:8080` (see
+`vite.config.ts`), so there's nothing CORS-specific to configure in either
+direction - in dev or once the built assets are eventually served from the
+same origin as the API (Phase 7).
+
+**Live updates, not polling as the primary path.** The dashboard opens one
+`EventSource` connection to `GET /api/v1/events` for its whole lifetime
+(`useJobEvents`/`JobEventsProvider`) and reacts to each event by
+invalidating the relevant TanStack Query caches - a background refetch
+interval exists too, but only as a safety net for the stream's inherent
+at-most-once gap (a dropped connection misses whatever happened while it
+was down), not as the thing driving normal updates. The part of this with
+actual correctness risk - folding a stream of events into state without
+losing or reordering anything - is isolated into a pure `(state, event) =>
+state` function (`src/lib/sseReducer.ts`) specifically so it's unit
+testable without a browser event source or any async machinery; that's
+also where the reasoning about why last-write-wins is safe here lives.
+
+**Throughput is a dedicated endpoint, not derived client-side.**
+`GET /api/v1/stats/throughput` returns succeeded-job counts bucketed by
+minute for the last hour, zero-filled server-side so the chart never has
+to guess at gaps. One grouped query beats shipping a raw hour of job rows
+to the browser to bucket there.
+
+**`cmd/seed`** populates a fresh database with backdated demo history (a
+spread of succeeded jobs, a few dead-lettered ones, two recurring
+schedules) so the deployed dashboard is never an empty read against an
+idle system. It's a no-op if the `jobs` table already has any rows, so
+it's safe to run on every boot rather than needing a one-time setup step.
+
 ## Limitations and tradeoffs so far
 
 - **Polling, not push.** Workers poll for work at `WORKER_POLL_INTERVAL`,
