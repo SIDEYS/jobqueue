@@ -72,6 +72,10 @@ func (s *Store) RunSchedule(ctx context.Context, scheduleID pgtype.UUID, nextRun
 		return nil, false, fmt.Errorf("store: run schedule: enqueue: %w", err)
 	}
 
+	if err := notifyJobEvent(ctx, tx, j.ID.String(), string(j.Status), j.Queue); err != nil {
+		return nil, false, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("store: run schedule: commit: %w", err)
 	}
