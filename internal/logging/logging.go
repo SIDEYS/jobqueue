@@ -54,6 +54,9 @@ func FromContext(ctx context.Context) *slog.Logger {
 // middleware.RequestID, which is what actually generates the id this
 // reads via middleware.GetReqID.
 func Middleware(base *slog.Logger) func(http.Handler) http.Handler {
+	if base == nil {
+		base = slog.Default()
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
