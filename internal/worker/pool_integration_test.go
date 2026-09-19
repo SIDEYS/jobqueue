@@ -82,7 +82,7 @@ func TestPoolShutdownReleasesInFlightJob(t *testing.T) {
 		PollBase:    50 * time.Millisecond,
 		PollMax:     200 * time.Millisecond,
 		JobTimeout:  time.Minute, // long enough not to fire during this test
-	})
+	}, nil)
 
 	inserted, _, err := q.Enqueue(ctx, queue.EnqueueParams{
 		Queue: "shutdown-test", JobType: "blocking", Payload: []byte(`{}`), MaxAttempts: 5,

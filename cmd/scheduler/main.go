@@ -2,25 +2,28 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/scheduler"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+	log := logging.New(getenv("LOG_LEVEL", "info"))
+	if err := run(log); err != nil {
+		log.Error("scheduler: fatal", "error", err)
+		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(log *slog.Logger) error {
 	dbURL := getenv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5432/jobqueue?sslmode=disable")
-	tickInterval := getenvDuration("SCHEDULER_TICK_INTERVAL", 10*time.Second)
+	tickInterval := getenvDuration("SCHEDULER_TICK_INTERVAL", 10*time.Second, log)
 
 	if err := store.Migrate(dbURL); err != nil {
 		return err
@@ -35,9 +38,9 @@ func run() error {
 	}
 	defer s.Close()
 
-	sched := scheduler.New(s, scheduler.DefaultLockKey)
+	sched := scheduler.New(s, scheduler.DefaultLockKey, log)
 
-	log.Printf("scheduler: ticking every %s", tickInterval)
+	log.Info("scheduler: ticking", "interval", tickInterval)
 	return sched.Run(ctx, tickInterval)
 }
 
@@ -48,14 +51,14 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvDuration(key string, fallback time.Duration) time.Duration {
+func getenvDuration(key string, fallback time.Duration, log *slog.Logger) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("scheduler: invalid duration for %s=%q, using default %s", key, v, fallback)
+		log.Warn("scheduler: invalid duration, using default", "key", key, "value", v, "default", fallback)
 		return fallback
 	}
 	return d

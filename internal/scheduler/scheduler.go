@@ -2,7 +2,7 @@ package scheduler
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/SIDEYS/jobqueue/internal/metrics"
@@ -19,12 +19,17 @@ const DefaultLockKey int64 = 0x6a6f6271
 type Scheduler struct {
 	store   *store.Store
 	elector *LeaderElector
+	log     *slog.Logger
 }
 
-func New(s *store.Store, lockKey int64) *Scheduler {
+func New(s *store.Store, lockKey int64, log *slog.Logger) *Scheduler {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Scheduler{
 		store:   s,
 		elector: NewLeaderElector(s.Pool(), lockKey),
+		log:     log,
 	}
 }
 
@@ -54,7 +59,7 @@ func (sc *Scheduler) Run(ctx context.Context, interval time.Duration) error {
 func (sc *Scheduler) tick(ctx context.Context) {
 	isLeader, err := sc.elector.EnsureLeadership(ctx)
 	if err != nil {
-		log.Printf("scheduler: leader election: %v", err)
+		sc.log.Error("scheduler: leader election", "error", err)
 		return
 	}
 	if !isLeader {
@@ -64,7 +69,7 @@ func (sc *Scheduler) tick(ctx context.Context) {
 	now := time.Now().UTC()
 	due, err := sc.store.DueSchedules(ctx, now, 100)
 	if err != nil {
-		log.Printf("scheduler: scan due schedules: %v", err)
+		sc.log.Error("scheduler: scan due schedules", "error", err)
 		return
 	}
 
@@ -85,7 +90,7 @@ func (sc *Scheduler) runOne(ctx context.Context, s *store.Schedule, now time.Tim
 	// catch-up jobs the moment the scheduler comes back.
 	next, err := NextRun(s.CronExpr, now)
 	if err != nil {
-		log.Printf("scheduler: schedule %s: %v", s.ID.String(), err)
+		sc.log.Error("scheduler: parse cron expression", "schedule_id", s.ID.String(), "error", err)
 		return
 	}
 
@@ -101,11 +106,11 @@ func (sc *Scheduler) runOne(ctx context.Context, s *store.Schedule, now time.Tim
 		MaxAttempts: s.MaxAttempts,
 	})
 	if err != nil {
-		log.Printf("scheduler: schedule %s: run: %v", s.ID.String(), err)
+		sc.log.Error("scheduler: run schedule", "schedule_id", s.ID.String(), "error", err)
 		return
 	}
 	if ran {
 		metrics.RecordEnqueued(s.Queue, s.JobType)
-		log.Printf("scheduler: fired schedule %s, next run %s", s.ID.String(), next)
+		sc.log.Info("scheduler: fired schedule", "schedule_id", s.ID.String(), "next_run_at", next)
 	}
 }

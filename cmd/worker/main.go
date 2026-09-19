@@ -3,37 +3,40 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/queue"
 	"github.com/SIDEYS/jobqueue/internal/store"
 	"github.com/SIDEYS/jobqueue/internal/worker"
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+	log := logging.New(getenv("LOG_LEVEL", "info"))
+	if err := run(log); err != nil {
+		log.Error("worker: fatal", "error", err)
+		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(log *slog.Logger) error {
 	dbURL := getenv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5432/jobqueue?sslmode=disable")
 	queueName := getenv("WORKER_QUEUE", "default")
-	visibilityTimeout := getenvDuration("JOB_VISIBILITY_TIMEOUT", time.Minute)
-	reapInterval := getenvDuration("REAPER_INTERVAL", 30*time.Second)
-	concurrency := getenvInt("WORKER_CONCURRENCY", 4)
-	batchSize := getenvInt("WORKER_CLAIM_BATCH_SIZE", 4)
-	pollBase := getenvDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond)
-	pollMax := getenvDuration("WORKER_MAX_POLL_INTERVAL", 2*time.Second)
-	jobTimeout := getenvDuration("WORKER_JOB_TIMEOUT", 30*time.Second)
-	drainTimeout := getenvDuration("WORKER_DRAIN_TIMEOUT", 25*time.Second)
-	heartbeatInterval := getenvDuration("WORKER_HEARTBEAT_INTERVAL", 10*time.Second)
-	heartbeatTTL := getenvDuration("WORKER_HEARTBEAT_TTL", 60*time.Second)
+	visibilityTimeout := getenvDuration("JOB_VISIBILITY_TIMEOUT", time.Minute, log)
+	reapInterval := getenvDuration("REAPER_INTERVAL", 30*time.Second, log)
+	concurrency := getenvInt("WORKER_CONCURRENCY", 4, log)
+	batchSize := getenvInt("WORKER_CLAIM_BATCH_SIZE", 4, log)
+	pollBase := getenvDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond, log)
+	pollMax := getenvDuration("WORKER_MAX_POLL_INTERVAL", 2*time.Second, log)
+	jobTimeout := getenvDuration("WORKER_JOB_TIMEOUT", 30*time.Second, log)
+	drainTimeout := getenvDuration("WORKER_DRAIN_TIMEOUT", 25*time.Second, log)
+	heartbeatInterval := getenvDuration("WORKER_HEARTBEAT_INTERVAL", 10*time.Second, log)
+	heartbeatTTL := getenvDuration("WORKER_HEARTBEAT_TTL", 60*time.Second, log)
 
 	if err := store.Migrate(dbURL); err != nil {
 		return err
@@ -71,9 +74,9 @@ func run() error {
 		PollBase:    pollBase,
 		PollMax:     pollMax,
 		JobTimeout:  jobTimeout,
-	})
-	heartbeat := worker.NewHeartbeater(s, workerID, hostname, heartbeatInterval, heartbeatTTL, pool.InFlightCount)
-	reaper := queue.NewReaper(s, visibilityTimeout)
+	}, log)
+	heartbeat := worker.NewHeartbeater(s, workerID, hostname, heartbeatInterval, heartbeatTTL, pool.InFlightCount, log)
+	reaper := queue.NewReaper(s, visibilityTimeout, log)
 
 	// See the reaper, run alongside every worker replica rather than as a
 	// dedicated singleton - concurrent reapers split the stale-job set via
@@ -81,14 +84,14 @@ func run() error {
 	// election for a task that's already safe to run concurrently.
 	errCh := make(chan error, 3)
 	go func() {
-		log.Printf("worker: polling queue %q as %q (concurrency=%d, batch=%d)", queueName, workerID, concurrency, batchSize)
+		log.Info("worker: polling", "queue", queueName, "worker_id", workerID, "concurrency", concurrency, "batch_size", batchSize)
 		errCh <- pool.Run(runCtx)
 	}()
 	go func() {
 		errCh <- heartbeat.Run(runCtx)
 	}()
 	go func() {
-		log.Printf("reaper: reclaiming jobs claimed over %s ago, every %s", visibilityTimeout, reapInterval)
+		log.Info("reaper: starting", "visibility_timeout", visibilityTimeout, "interval", reapInterval)
 		errCh <- reaper.Run(runCtx, reapInterval)
 	}()
 
@@ -99,7 +102,7 @@ func run() error {
 	case err := <-errCh:
 		return err
 	case <-sigCh:
-		return shutdown(pool, drainTimeout, stopRun)
+		return shutdown(pool, drainTimeout, stopRun, log)
 	}
 }
 
@@ -114,8 +117,8 @@ func run() error {
 // before Shutdown gets to release in-flight claims, and those jobs sit
 // stuck until the reaper's visibility timeout catches them instead of
 // being immediately reclaimable.
-func shutdown(pool *worker.Pool, drainTimeout time.Duration, stopRun context.CancelFunc) error {
-	log.Print("worker: shutting down")
+func shutdown(pool *worker.Pool, drainTimeout time.Duration, stopRun context.CancelFunc, log *slog.Logger) error {
+	log.Info("worker: shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
 
@@ -131,27 +134,27 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvDuration(key string, fallback time.Duration) time.Duration {
+func getenvDuration(key string, fallback time.Duration, log *slog.Logger) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("worker: invalid duration for %s=%q, using default %s", key, v, fallback)
+		log.Warn("worker: invalid duration, using default", "key", key, "value", v, "default", fallback)
 		return fallback
 	}
 	return d
 }
 
-func getenvInt(key string, fallback int) int {
+func getenvInt(key string, fallback int, log *slog.Logger) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		log.Printf("worker: invalid integer for %s=%q, using default %d", key, v, fallback)
+		log.Warn("worker: invalid integer, using default", "key", key, "value", v, "default", fallback)
 		return fallback
 	}
 	return n

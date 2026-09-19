@@ -48,7 +48,7 @@ func TestPoolJobTimeoutFailsThenDeadLetters(t *testing.T) {
 		PollBase:    50 * time.Millisecond,
 		PollMax:     200 * time.Millisecond,
 		JobTimeout:  200 * time.Millisecond,
-	})
+	}, nil)
 
 	inserted, _, err := q.Enqueue(ctx, queue.EnqueueParams{
 		Queue: "timeout-test", JobType: "hang", Payload: []byte(`{}`), MaxAttempts: 2,

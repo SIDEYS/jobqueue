@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -31,6 +31,7 @@ type Pool struct {
 	queue    *queue.Queue
 	registry *Registry
 	cfg      Config
+	log      *slog.Logger
 
 	mu       sync.Mutex
 	inFlight map[string]*store.Job
@@ -40,11 +41,15 @@ type Pool struct {
 	stopCh   chan struct{}
 }
 
-func NewPool(q *queue.Queue, r *Registry, cfg Config) *Pool {
+func NewPool(q *queue.Queue, r *Registry, cfg Config, log *slog.Logger) *Pool {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Pool{
 		queue:    q,
 		registry: r,
 		cfg:      cfg,
+		log:      log,
 		inFlight: make(map[string]*store.Job),
 		stopCh:   make(chan struct{}),
 	}
@@ -170,12 +175,12 @@ func (p *Pool) report(job *store.Job, cause error) {
 
 	if cause != nil {
 		if err := p.queue.Fail(ctx, job, cause); err != nil {
-			logTerminalWrite(job.ID.String(), "failed", err)
+			p.logTerminalWrite(job.ID.String(), "failed", err)
 		}
 		return
 	}
 	if err := p.queue.Complete(ctx, job); err != nil {
-		logTerminalWrite(job.ID.String(), "succeeded", err)
+		p.logTerminalWrite(job.ID.String(), "succeeded", err)
 	}
 }
 
@@ -228,7 +233,7 @@ func (p *Pool) releaseInFlight() error {
 	var firstErr error
 	for _, job := range remaining {
 		if err := p.queue.Release(releaseCtx, job); err != nil {
-			logTerminalWrite(job.ID.String(), "released", err)
+			p.logTerminalWrite(job.ID.String(), "released", err)
 			if !errors.Is(err, queue.ErrStaleClaim) && firstErr == nil {
 				firstErr = err
 			}
@@ -241,10 +246,10 @@ func (p *Pool) releaseInFlight() error {
 // concurrent Shutdown) already reclaimed this job out from under its
 // claimant, so this write is stale by design - from a genuine unexpected
 // error.
-func logTerminalWrite(jobID, outcome string, err error) {
+func (p *Pool) logTerminalWrite(jobID, outcome string, err error) {
 	if errors.Is(err, queue.ErrStaleClaim) {
-		log.Printf("worker: job %s attempted to record %s but its claim was already reclaimed; discarding this attempt's result", jobID, outcome)
+		p.log.Info("worker: job claim already reclaimed, discarding stale write", "job_id", jobID, "outcome", outcome)
 		return
 	}
-	log.Printf("worker: job %s %s: %v", jobID, outcome, err)
+	p.log.Error("worker: terminal write failed", "job_id", jobID, "outcome", outcome, "error", err)
 }

@@ -2,7 +2,7 @@ package queue
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/SIDEYS/jobqueue/internal/metrics"
@@ -25,14 +25,19 @@ type Reaper struct {
 	clock             Clock
 	visibilityTimeout time.Duration
 	batchSize         int
+	log               *slog.Logger
 }
 
-func NewReaper(s *store.Store, visibilityTimeout time.Duration) *Reaper {
+func NewReaper(s *store.Store, visibilityTimeout time.Duration, log *slog.Logger) *Reaper {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Reaper{
 		store:             s,
 		clock:             realClock{},
 		visibilityTimeout: visibilityTimeout,
 		batchSize:         100,
+		log:               log,
 	}
 }
 
@@ -83,11 +88,11 @@ func (r *Reaper) Run(ctx context.Context, interval time.Duration) error {
 		case <-ticker.C:
 			jobs, err := r.ReclaimOnce(ctx)
 			if err != nil {
-				log.Printf("reaper: reclaim: %v", err)
+				r.log.Error("reaper: reclaim", "error", err)
 				continue
 			}
 			if len(jobs) > 0 {
-				log.Printf("reaper: reclaimed %d stale job(s)", len(jobs))
+				r.log.Info("reaper: reclaimed stale jobs", "count", len(jobs))
 			}
 		}
 	}

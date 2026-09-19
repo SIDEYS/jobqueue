@@ -15,13 +15,13 @@ func (f fakeClock) Now() time.Time { return f.now }
 
 func TestReaperThresholdIsNowMinusVisibilityTimeout(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	r := NewReaper(nil, 90*time.Second).WithClock(fakeClock{now: now})
+	r := NewReaper(nil, 90*time.Second, nil).WithClock(fakeClock{now: now})
 
 	require.Equal(t, now.Add(-90*time.Second), r.Threshold())
 }
 
 func TestReaperThresholdMovesWithTheInjectedClock(t *testing.T) {
-	r := NewReaper(nil, time.Minute).WithClock(fakeClock{now: time.Unix(1000, 0)})
+	r := NewReaper(nil, time.Minute, nil).WithClock(fakeClock{now: time.Unix(1000, 0)})
 	first := r.Threshold()
 
 	r.WithClock(fakeClock{now: time.Unix(2000, 0)})

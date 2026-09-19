@@ -2,7 +2,7 @@ package worker
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/SIDEYS/jobqueue/internal/store"
@@ -23,9 +23,13 @@ type Heartbeater struct {
 	interval time.Duration
 	ttl      time.Duration
 	inFlight func() int
+	log      *slog.Logger
 }
 
-func NewHeartbeater(s *store.Store, id, hostname string, interval, ttl time.Duration, inFlight func() int) *Heartbeater {
+func NewHeartbeater(s *store.Store, id, hostname string, interval, ttl time.Duration, inFlight func() int, log *slog.Logger) *Heartbeater {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Heartbeater{
 		store:    s,
 		id:       id,
@@ -33,6 +37,7 @@ func NewHeartbeater(s *store.Store, id, hostname string, interval, ttl time.Dura
 		interval: interval,
 		ttl:      ttl,
 		inFlight: inFlight,
+		log:      log,
 	}
 }
 
@@ -56,15 +61,15 @@ func (h *Heartbeater) Run(ctx context.Context) error {
 
 func (h *Heartbeater) beat(ctx context.Context) {
 	if err := h.store.UpsertHeartbeat(ctx, h.id, h.hostname, h.inFlight()); err != nil {
-		log.Printf("heartbeat: upsert: %v", err)
+		h.log.Error("heartbeat: upsert", "error", err)
 	}
 
 	n, err := h.store.DeleteStaleWorkers(ctx, time.Now().Add(-h.ttl))
 	if err != nil {
-		log.Printf("heartbeat: cleanup: %v", err)
+		h.log.Error("heartbeat: cleanup", "error", err)
 		return
 	}
 	if n > 0 {
-		log.Printf("heartbeat: removed %d stale worker row(s)", n)
+		h.log.Info("heartbeat: removed stale worker rows", "count", n)
 	}
 }

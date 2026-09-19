@@ -88,9 +88,9 @@ func TestThreeSchedulersExactlyOneEnqueuePerTick(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	sc1 := scheduler.New(s1, scheduler.DefaultLockKey)
-	sc2 := scheduler.New(s2, scheduler.DefaultLockKey)
-	sc3 := scheduler.New(s3, scheduler.DefaultLockKey)
+	sc1 := scheduler.New(s1, scheduler.DefaultLockKey, nil)
+	sc2 := scheduler.New(s2, scheduler.DefaultLockKey, nil)
+	sc3 := scheduler.New(s3, scheduler.DefaultLockKey, nil)
 
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()

@@ -24,7 +24,7 @@ type instance struct {
 }
 
 func startInstance(s *store.Store, tick time.Duration) *instance {
-	sc := scheduler.New(s, scheduler.DefaultLockKey)
+	sc := scheduler.New(s, scheduler.DefaultLockKey, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- sc.Run(ctx, tick) }()
