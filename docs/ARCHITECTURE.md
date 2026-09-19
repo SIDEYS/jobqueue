@@ -71,3 +71,31 @@ it. That's the part only the handler itself can make safe, which is why
 at-least-once delivery is a contract on handler authors, not just a
 property of the queue: **every handler must be idempotent**, because the
 system can and will occasionally run one twice.
+
+## Live updates (SSE) are a hint, not a source of truth
+
+`GET /api/v1/events` streams job state transitions over Server-Sent
+Events, published via Postgres `NOTIFY`/`LISTEN` (see
+`internal/store/notify.go` and `internal/events`). It is convenient for a
+UI to feel live, but it is **not a reliable log** of everything that
+happened, and building on top of it as if it were is the mistake worth
+naming explicitly here.
+
+SSE delivery is at-most-once. A client that hasn't connected yet, that's
+mid-reconnect, or that the server dropped for falling behind (see
+`events.Hub`'s backpressure handling) simply never sees whatever happened
+during that gap - there is no replay, no sequence number, no "catch me
+up" mechanism. This isn't a bug to fix; it's inherent to a fan-out
+pub/sub built on `NOTIFY`, which itself makes no delivery guarantee to a
+listener that wasn't listening at the time.
+
+The correct way to consume this stream, and the only way the dashboard
+(Phase 6) is built to use it: **fetch current state first, then treat
+each event as a signal to refetch, not as the update itself.** On
+connect, call the normal REST endpoints (`GET /api/v1/jobs`, `GET
+/api/v1/queues`, etc.) to get a real snapshot. After that, an incoming
+event means "something changed for this job/queue - go re-fetch it if
+you care," not "here is the new state, apply it directly." A client that
+treats the stream as authoritative will drift silently out of sync with
+reality the first time it misses an event, and have no way to know it
+happened.
