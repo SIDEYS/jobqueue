@@ -42,6 +42,11 @@ func NewRouter(q *queue.Queue, s *store.Store, hub *events.Hub, log *slog.Logger
 		r.Get("/queues", a.queueStats)
 		r.Get("/workers", a.listWorkers)
 		r.Get("/events", a.events)
+		r.Post("/schedules", a.createSchedule)
+		r.Get("/schedules", a.listSchedules)
+		r.Get("/schedules/{id}", a.getSchedule)
+		r.Patch("/schedules/{id}", a.updateSchedule)
+		r.Delete("/schedules/{id}", a.deleteSchedule)
 	})
 
 	return r
