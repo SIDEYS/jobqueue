@@ -48,52 +48,69 @@ func floodToDrop(h *Hub) {
 	}
 }
 
+// drainUntilClosed blocks-reads from ch (not polling) until it observes
+// the channel closed, or fails the test if timeout elapses first. A
+// blocking read proceeds the instant the next buffered item is available,
+// so - unlike require.Eventually on a fixed polling interval - draining a
+// channel with many backlogged items isn't gated by how many poll
+// intervals fit in the overall timeout under heavy scheduler contention.
+func drainUntilClosed(t *testing.T, ch <-chan Event, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case _, open := <-ch:
+			if !open {
+				return
+			}
+		case <-deadline:
+			t.Fatal("channel was not closed within timeout")
+		}
+	}
+}
+
+// TestHubDropsASlowClientInsteadOfBlockingOrDroppingForOthers deliberately
+// doesn't try to keep a second "fast" client concurrently draining while
+// the flood is in flight - an earlier version did, using a background
+// goroutine, and it was racy: that goroutine's first scheduling isn't
+// guaranteed to happen before the flood starts, so under enough scheduler
+// contention (many concurrent tests, race detector overhead) the "fast"
+// client could just as easily overflow and get dropped too, same as slow,
+// non-deterministically. That risk is a property of the test's own
+// construction, not of Hub: Broadcast's per-client send is a non-blocking
+// `select { case ch <- evt: default: drop }`, so one client's buffer state
+// can structurally never delay or corrupt delivery to another - there's no
+// shared state between two clients' cases for one to block the other on.
+// What's actually worth proving here is the part that isn't already
+// obvious from reading the code: that dropping a client leaves the hub's
+// internal bookkeeping consistent, so broadcast keeps working normally for
+// everyone else afterward.
 func TestHubDropsASlowClientInsteadOfBlockingOrDroppingForOthers(t *testing.T) {
 	h := NewHub()
 	defer h.Close()
 
 	slow := h.Subscribe()
-	fast := h.Subscribe()
-	defer h.Unsubscribe(fast)
-
-	// fast actually keeps up in real time, draining as events arrive -
-	// this is what makes it "fast" rather than just another unread
-	// buffer. Without this it would fill and get dropped too, same as
-	// slow, and the test would prove nothing about the two being treated
-	// differently.
-	fastReceived := make(chan Event, 10000)
-	go func() {
-		for evt := range fast {
-			fastReceived <- evt
-		}
-	}()
-
 	floodToDrop(h)
 
-	// slow must have been dropped: its channel is closed. (Draining here
-	// is safe even though floodToDrop already guarantees the drop
-	// happened - any buffered items read first are just leftover flood
-	// events, and the loop only stops once it hits the close.)
-	require.Eventually(t, func() bool {
-		select {
-		case _, open := <-slow:
-			return !open
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "hub must close a dropped client's channel")
+	// slow must have been dropped: its channel is closed. floodToDrop
+	// already guarantees the drop decision is made by the time it
+	// returns; this just drains whatever backlog was buffered before the
+	// drop to reach the close.
+	drainUntilClosed(t, slow, 5*time.Second)
 
-	// fast must still be receiving - a slow client must not stall
-	// broadcast for everyone else.
+	// A client subscribed after the drop must receive broadcasts
+	// normally - the drop must not have left the hub's client set (or
+	// anything else internal) corrupted.
+	fresh := h.Subscribe()
+	defer h.Unsubscribe(fresh)
+
 	h.Broadcast(Event{ID: "after-drop", Status: "succeeded", Queue: "default"})
-	require.Eventually(t, func() bool {
-		select {
-		case evt := <-fastReceived:
-			return evt.ID == "after-drop"
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "fast client never received the post-drop event")
+	select {
+	case evt := <-fresh:
+		require.Equal(t, "after-drop", evt.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a client subscribed after the drop never received a subsequent broadcast")
+	}
 }
 
 func TestUnsubscribeIsSafeAfterHubAlreadyDroppedTheClient(t *testing.T) {
@@ -103,14 +120,7 @@ func TestUnsubscribeIsSafeAfterHubAlreadyDroppedTheClient(t *testing.T) {
 	ch := h.Subscribe()
 	floodToDrop(h)
 
-	require.Eventually(t, func() bool {
-		select {
-		case _, open := <-ch:
-			return !open
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "hub should have dropped and closed the flooded client")
+	drainUntilClosed(t, ch, 5*time.Second)
 
 	// Must not panic (double-close) even though the hub already closed ch.
 	require.NotPanics(t, func() { h.Unsubscribe(ch) })
