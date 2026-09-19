@@ -24,6 +24,30 @@ func TestHubDeliversToASingleSubscriber(t *testing.T) {
 	}
 }
 
+// floodToDrop sends enough broadcasts to fill ch's buffer and force Hub to
+// drop it, then sends one further broadcast before returning.
+//
+// That trailing extra broadcast matters for determinism: Broadcast(evt)
+// only blocks until run() has *received* evt, not until run() has finished
+// deciding what to do with it (buffer it or drop the client) - that
+// decision happens later in the same iteration of run()'s loop, after the
+// channel send has already unblocked the caller. So the very last
+// broadcast in a flood can still be mid-decision in run() at the moment
+// this function returns, and a concurrent reader draining the buffer at
+// exactly that moment can "rescue" it into being buffered instead of
+// dropped, racily. Every broadcast *before* the last one doesn't have
+// this problem: run() can't receive broadcast N+1 until it has looped
+// back to select, which requires broadcast N's full handling - including
+// the drop decision - to have already finished. So one harmless trailing
+// broadcast after the one that fills the buffer is enough to guarantee,
+// by the time this function returns, that the fill-triggering broadcast's
+// fate has already been decided.
+func floodToDrop(h *Hub) {
+	for i := 0; i < eventBufferSize+2; i++ {
+		h.Broadcast(Event{ID: "flood", Status: "x", Queue: "q"})
+	}
+}
+
 func TestHubDropsASlowClientInsteadOfBlockingOrDroppingForOthers(t *testing.T) {
 	h := NewHub()
 	defer h.Close()
@@ -44,13 +68,12 @@ func TestHubDropsASlowClientInsteadOfBlockingOrDroppingForOthers(t *testing.T) {
 		}
 	}()
 
-	// Fill slow's buffer without ever reading it, then push one more than
-	// it can hold.
-	for i := 0; i < eventBufferSize+1; i++ {
-		h.Broadcast(Event{ID: "flood", Status: "x", Queue: "q"})
-	}
+	floodToDrop(h)
 
-	// slow must have been dropped: its channel is closed.
+	// slow must have been dropped: its channel is closed. (Draining here
+	// is safe even though floodToDrop already guarantees the drop
+	// happened - any buffered items read first are just leftover flood
+	// events, and the loop only stops once it hits the close.)
 	require.Eventually(t, func() bool {
 		select {
 		case _, open := <-slow:
@@ -78,13 +101,15 @@ func TestUnsubscribeIsSafeAfterHubAlreadyDroppedTheClient(t *testing.T) {
 	defer h.Close()
 
 	ch := h.Subscribe()
-	for i := 0; i < eventBufferSize+1; i++ {
-		h.Broadcast(Event{ID: "flood", Status: "x", Queue: "q"})
-	}
+	floodToDrop(h)
 
 	require.Eventually(t, func() bool {
-		_, open := <-ch
-		return !open
+		select {
+		case _, open := <-ch:
+			return !open
+		default:
+			return false
+		}
 	}, 2*time.Second, 10*time.Millisecond, "hub should have dropped and closed the flooded client")
 
 	// Must not panic (double-close) even though the hub already closed ch.
