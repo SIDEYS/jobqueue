@@ -10,8 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/SIDEYS/jobqueue/internal/api"
 	"github.com/SIDEYS/jobqueue/internal/events"
+	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/queue"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
@@ -41,6 +44,8 @@ func run() error {
 		return err
 	}
 	defer s.Close()
+
+	prometheus.MustRegister(metrics.NewDBCollectors(s.Pool()))
 
 	q := queue.New(s)
 	hub := events.NewHub()

@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/SIDEYS/jobqueue/internal/events"
 	"github.com/SIDEYS/jobqueue/internal/queue"
@@ -23,6 +24,8 @@ func NewRouter(q *queue.Queue, hub *events.Hub) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
+
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/jobs", a.enqueueJob)
