@@ -195,6 +195,43 @@ func TestListWorkersEndpoint(t *testing.T) {
 	require.Equal(t, int32(2), got.Workers[0].JobsInFlight)
 }
 
+func TestThroughputEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	srv, _, q := newTestServer(t, ctx)
+
+	_, _, err := q.Enqueue(ctx, queue.EnqueueParams{
+		Queue: "throughput-test", JobType: "sleep", Payload: []byte(`{}`), MaxAttempts: 5,
+	})
+	require.NoError(t, err)
+	claimed, err := q.Claim(ctx, "throughput-test", 1, "throughput-worker")
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NoError(t, q.Complete(ctx, claimed[0]))
+
+	var got struct {
+		Buckets []struct {
+			Minute    string `json:"minute"`
+			Succeeded int64  `json:"succeeded"`
+		} `json:"buckets"`
+	}
+	resp := getJSON(t, srv.URL+"/api/v1/stats/throughput", &got)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.Len(t, got.Buckets, 61, "one bucket per minute across a full hour window, inclusive of both ends")
+
+	var total int64
+	for _, b := range got.Buckets {
+		total += b.Succeeded
+	}
+	require.Equal(t, int64(1), total, "the one completed job must appear exactly once, in whichever minute bucket it landed in")
+
+	completedAt, err := time.Parse(time.RFC3339, got.Buckets[len(got.Buckets)-1].Minute)
+	require.NoError(t, err)
+	require.WithinDuration(t, time.Now().UTC(), completedAt, time.Minute, "the job completed just now, so it must land in the most recent bucket")
+}
+
 func TestScheduleCRUDEndpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
