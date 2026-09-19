@@ -65,6 +65,36 @@ anyway, and if that goroutine does eventually report an outcome, the same
 `claimed_by` fencing check the reaper relies on makes it a safe no-op once
 someone else has reclaimed the job.
 
+### Cron scheduling
+
+Schedules fire on their own tick loop (`internal/scheduler`), not
+`robfig/cron/v3`'s scheduler - only its expression parser is used. Two
+decisions worth knowing about:
+
+- **Missed ticks are not replayed.** A schedule's `next_run_at` is always
+  computed forward from the current instant (`NextRun(expr, time.Now())`),
+  never from its own `last_run_at` or its previous, possibly long-stale,
+  `next_run_at`. If the scheduler is down for an hour and a schedule fires
+  every five minutes, it fires exactly **once** on the next tick and jumps
+  straight to its next real future occurrence - not twelve backlogged
+  runs. This is the standard cron semantic (at most once per interval),
+  and it's the same thundering-herd concern the retry jitter above exists
+  for: a deploy that takes a few minutes must not produce a burst of
+  catch-up jobs the moment the scheduler comes back.
+- **UTC only.** Cron expressions are evaluated against UTC wall-clock
+  time; there's no per-schedule timezone. Cron plus local time plus DST
+  is a well-known way to have a job fire twice in November and zero times
+  in March - not worth supporting, so it's explicitly not attempted
+  rather than silently wrong.
+
+Leader election (which of possibly several scheduler replicas actually
+fires due schedules) uses a Postgres advisory lock, but the lock is an
+optimization, not what actually prevents a schedule from firing twice -
+see [`docs/adr/0001`](docs/adr/0001-advisory-lock-leader-election.md) for
+why, and for a subtle failure mode (a connection that still holds the
+lock leaking it into the pool) worth understanding before touching
+`internal/scheduler/leader.go`.
+
 ## Limitations and tradeoffs so far
 
 - **Polling, not push.** Workers poll for work at `WORKER_POLL_INTERVAL`,
