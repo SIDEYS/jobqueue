@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/scheduler"
@@ -24,6 +27,7 @@ func main() {
 func run(log *slog.Logger) error {
 	dbURL := getenv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5432/jobqueue?sslmode=disable")
 	tickInterval := getenvDuration("SCHEDULER_TICK_INTERVAL", 10*time.Second, log)
+	metricsAddr := getenv("SCHEDULER_METRICS_ADDR", ":9092")
 
 	if err := store.Migrate(dbURL); err != nil {
 		return err
@@ -39,6 +43,18 @@ func run(log *slog.Logger) error {
 	defer s.Close()
 
 	sched := scheduler.New(s, scheduler.DefaultLockKey, log)
+
+	// Its own process, its own in-memory Prometheus registry - see the
+	// identical comment in cmd/worker/main.go for why this can't just
+	// piggyback on the API's /metrics.
+	metricsSrv := &http.Server{Addr: metricsAddr, Handler: promhttp.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		log.Info("scheduler: metrics listening", "addr", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("scheduler: metrics server", "error", err)
+		}
+	}()
+	defer metricsSrv.Close()
 
 	log.Info("scheduler: ticking", "interval", tickInterval)
 	return sched.Run(ctx, tickInterval)

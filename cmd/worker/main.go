@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/queue"
@@ -37,6 +40,7 @@ func run(log *slog.Logger) error {
 	drainTimeout := getenvDuration("WORKER_DRAIN_TIMEOUT", 25*time.Second, log)
 	heartbeatInterval := getenvDuration("WORKER_HEARTBEAT_INTERVAL", 10*time.Second, log)
 	heartbeatTTL := getenvDuration("WORKER_HEARTBEAT_TTL", 60*time.Second, log)
+	metricsAddr := getenv("WORKER_METRICS_ADDR", ":9091")
 
 	if err := store.Migrate(dbURL); err != nil {
 		return err
@@ -78,11 +82,20 @@ func run(log *slog.Logger) error {
 	heartbeat := worker.NewHeartbeater(s, workerID, hostname, heartbeatInterval, heartbeatTTL, pool.InFlightCount, log)
 	reaper := queue.NewReaper(s, visibilityTimeout, log)
 
+	// Every binary that records metrics exposes its own /metrics - each is
+	// a separate process with its own in-memory Prometheus registry, so a
+	// counter recorded here (jobs succeeded, job duration, queue wait) is
+	// only ever visible on this process's own endpoint, never on the
+	// API's. Prometheus scrapes each instance independently and
+	// aggregates at query time; there's no central process metrics get
+	// routed through.
+	metricsSrv := &http.Server{Addr: metricsAddr, Handler: promhttp.Handler(), ReadHeaderTimeout: 5 * time.Second}
+
 	// See the reaper, run alongside every worker replica rather than as a
 	// dedicated singleton - concurrent reapers split the stale-job set via
 	// the same SKIP LOCKED pattern as claiming, instead of needing leader
 	// election for a task that's already safe to run concurrently.
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() {
 		log.Info("worker: polling", "queue", queueName, "worker_id", workerID, "concurrency", concurrency, "batch_size", batchSize)
 		errCh <- pool.Run(runCtx)
@@ -94,6 +107,12 @@ func run(log *slog.Logger) error {
 		log.Info("reaper: starting", "visibility_timeout", visibilityTimeout, "interval", reapInterval)
 		errCh <- reaper.Run(runCtx, reapInterval)
 	}()
+	go func() {
+		log.Info("worker: metrics listening", "addr", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -102,7 +121,7 @@ func run(log *slog.Logger) error {
 	case err := <-errCh:
 		return err
 	case <-sigCh:
-		return shutdown(pool, drainTimeout, stopRun, log)
+		return shutdown(pool, metricsSrv, drainTimeout, stopRun, log)
 	}
 }
 
@@ -117,13 +136,14 @@ func run(log *slog.Logger) error {
 // before Shutdown gets to release in-flight claims, and those jobs sit
 // stuck until the reaper's visibility timeout catches them instead of
 // being immediately reclaimable.
-func shutdown(pool *worker.Pool, drainTimeout time.Duration, stopRun context.CancelFunc, log *slog.Logger) error {
+func shutdown(pool *worker.Pool, metricsSrv *http.Server, drainTimeout time.Duration, stopRun context.CancelFunc, log *slog.Logger) error {
 	log.Info("worker: shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
 
 	err := pool.Shutdown(ctx)
 	stopRun()
+	_ = metricsSrv.Close()
 	return err
 }
 
