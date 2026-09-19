@@ -55,7 +55,7 @@ func run(log *slog.Logger) error {
 	defer hub.Close()
 	listener := events.NewListener(s.Pool(), hub, log)
 
-	router := api.NewRouter(q, hub, log)
+	router := api.NewRouter(q, s, hub, log)
 
 	srv := &http.Server{
 		Addr:              addr,

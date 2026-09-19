@@ -13,21 +13,25 @@ import (
 	"github.com/SIDEYS/jobqueue/internal/events"
 	"github.com/SIDEYS/jobqueue/internal/logging"
 	"github.com/SIDEYS/jobqueue/internal/queue"
+	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
 type API struct {
 	queue *queue.Queue
+	store *store.Store
 	hub   *events.Hub
 }
 
-func NewRouter(q *queue.Queue, hub *events.Hub, log *slog.Logger) http.Handler {
-	a := &API{queue: q, hub: hub}
+func NewRouter(q *queue.Queue, s *store.Store, hub *events.Hub, log *slog.Logger) http.Handler {
+	a := &API{queue: q, store: s, hub: hub}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 	r.Use(logging.Middleware(log))
 
+	r.Get("/healthz", a.healthz)
+	r.Get("/readyz", a.readyz)
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/api/v1", func(r chi.Router) {
