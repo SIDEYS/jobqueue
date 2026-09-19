@@ -25,8 +25,17 @@ import (
 // in the same instant the reaper decides that claimant is dead. Skipping a
 // locked row just leaves it for the next reclaim pass, once whichever
 // write is in flight has committed.
+//
+// Wrapped in an explicit transaction, like ClaimJobs, only so a job_events
+// notification can be published for each reclaimed row before commit.
 func (s *Store) ReclaimStale(ctx context.Context, threshold time.Time, limit int) ([]*Job, error) {
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: reclaim stale: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	rows, err := tx.Query(ctx, `
 		WITH stale AS (
 			SELECT id FROM jobs
 			WHERE status = 'running' AND claimed_at < $1
@@ -54,18 +63,30 @@ func (s *Store) ReclaimStale(ctx context.Context, threshold time.Time, limit int
 	if err != nil {
 		return nil, fmt.Errorf("store: reclaim stale: %w", err)
 	}
-	defer rows.Close()
 
 	var jobs []*Job
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: reclaim stale: %w", err)
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("store: reclaim stale: %w", rowsErr)
+	}
+
+	for _, j := range jobs {
+		if err := notifyJobEvent(ctx, tx, j.ID.String(), string(j.Status), j.Queue); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: reclaim stale: commit: %w", err)
 	}
 	return jobs, nil
 }

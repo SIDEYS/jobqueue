@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type JobStatus string
@@ -68,6 +69,29 @@ func scanJob(row pgx.Row) (*Job, error) {
 	return &j, nil
 }
 
+// scanJobWithInserted scans a row whose first column is the
+// `(xmax = 0) AS inserted` marker described in InsertJob, followed by the
+// usual jobColumns.
+func scanJobWithInserted(row pgx.Row) (*Job, bool, error) {
+	var (
+		j        Job
+		inserted bool
+	)
+	err := row.Scan(
+		&inserted,
+		&j.ID, &j.Queue, &j.JobType, &j.Payload, &j.Status, &j.Priority, &j.RunAt,
+		&j.Attempts, &j.MaxAttempts, &j.LastError, &j.IdempotencyKey, &j.ClaimedBy,
+		&j.ClaimedAt, &j.CreatedAt, &j.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, ErrNotFound
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: scan job: %w", err)
+	}
+	return &j, inserted, nil
+}
+
 type InsertJobParams struct {
 	Queue          string
 	JobType        string
@@ -80,30 +104,65 @@ type InsertJobParams struct {
 
 // InsertJob enqueues a job. If IdempotencyKey is set and a job with the
 // same (queue, idempotency_key) already exists, the existing row is
-// returned instead of creating a duplicate.
+// returned instead of creating a duplicate - inserted reports which of
+// the two happened, so callers can decide whether this was a real new
+// job (e.g. for metrics and the job_events notification) or just an
+// idempotent replay of a request they'd already seen.
 //
-// This is one statement rather than an insert-then-fetch-on-conflict,
-// because a two-step version is only correct under READ COMMITTED: the
-// fetch would rely on seeing a row committed by a concurrent transaction
-// after this transaction's own insert returned nothing, which a
-// REPEATABLE READ (or stricter) transaction's snapshot would not see,
-// silently returning "no job" instead of the real one. ON CONFLICT ...
-// DO UPDATE ... RETURNING has no such window: Postgres resolves the
-// conflict and returns the winning row within the same statement,
-// regardless of isolation level. The DO UPDATE itself is a genuine no-op
-// (updated_at is set to its own current value) - it exists only because
-// RETURNING requires a matching DO UPDATE; ON CONFLICT DO NOTHING returns
-// no row at all on a conflict.
-func (s *Store) InsertJob(ctx context.Context, p InsertJobParams) (*Job, error) {
-	row := s.pool.QueryRow(ctx, `
+// The insert statement itself is one round trip rather than an
+// insert-then-fetch-on-conflict, because a two-step version is only
+// correct under READ COMMITTED: the fetch would rely on seeing a row
+// committed by a concurrent transaction after this transaction's own
+// insert returned nothing, which a REPEATABLE READ (or stricter)
+// transaction's snapshot would not see, silently returning "no job"
+// instead of the real one. ON CONFLICT ... DO UPDATE ... RETURNING has no
+// such window: Postgres resolves the conflict and returns the winning row
+// within the same statement, regardless of isolation level. The DO UPDATE
+// itself is a genuine no-op (updated_at is set to its own current value)
+// - it exists only because RETURNING requires a matching DO UPDATE; ON
+// CONFLICT DO NOTHING returns no row at all on a conflict.
+//
+// `(xmax = 0) AS inserted` is how that distinction is read back: xmax is
+// Postgres's internal "which transaction deleted/updated this row" system
+// column, left at its zero default on a row's original INSERT and set to
+// the current transaction's id the moment something updates it - so a row
+// this same command just freshly inserted always has xmax = 0, while one
+// it instead hit via the ON CONFLICT DO UPDATE path does not.
+//
+// Enqueueing and notifying happen in the same transaction: NOTIFY is
+// itself transactional (delivered at COMMIT, discarded on ROLLBACK), so
+// this can't publish an event for a job that didn't actually get created.
+func (s *Store) InsertJob(ctx context.Context, p InsertJobParams) (job *Job, inserted bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: insert job: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	row := tx.QueryRow(ctx, `
 		INSERT INTO jobs (queue, job_type, payload, priority, run_at, max_attempts, idempotency_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO UPDATE SET updated_at = jobs.updated_at
-		RETURNING `+jobColumns,
+		RETURNING (xmax = 0) AS inserted, `+jobColumns,
 		p.Queue, p.JobType, p.Payload, p.Priority, p.RunAt, p.MaxAttempts, p.IdempotencyKey,
 	)
-	return scanJob(row)
+
+	j, wasInserted, err := scanJobWithInserted(row)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if wasInserted {
+		if err := notifyJobEvent(ctx, tx, j.ID.String(), string(j.Status), j.Queue); err != nil {
+			return nil, false, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("store: insert job: commit: %w", err)
+	}
+	return j, wasInserted, nil
 }
 
 func (s *Store) GetJob(ctx context.Context, id pgtype.UUID) (*Job, error) {
@@ -136,9 +195,18 @@ func (s *Store) GetJob(ctx context.Context, id pgtype.UUID) (*Job, error) {
 // The UPDATE...FROM claimed pattern folds the "mark as running" step into
 // the same statement as the SELECT, so the whole claim is one round trip
 // and one implicit transaction - there is no window between "select" and
-// "mark claimed" for another process to see the row as still pending.
+// "mark claimed" for another process to see the row as still pending. It's
+// wrapped in an explicit transaction here (rather than left as its own
+// single implicit one) only so a job_events notification can be published
+// for each claimed row before commit - see notifyJobEvent.
 func (s *Store) ClaimJobs(ctx context.Context, queue string, limit int, workerID string) ([]*Job, error) {
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: claim jobs: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	rows, err := tx.Query(ctx, `
 		WITH claimed AS (
 			SELECT id FROM jobs
 			WHERE status = 'pending' AND queue = $1 AND run_at <= now()
@@ -160,18 +228,30 @@ func (s *Store) ClaimJobs(ctx context.Context, queue string, limit int, workerID
 	if err != nil {
 		return nil, fmt.Errorf("store: claim jobs: %w", err)
 	}
-	defer rows.Close()
 
 	var jobs []*Job
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: claim jobs: %w", err)
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return nil, fmt.Errorf("store: claim jobs: %w", rowsErr)
+	}
+
+	for _, j := range jobs {
+		if err := notifyJobEvent(ctx, tx, j.ID.String(), string(j.Status), j.Queue); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("store: claim jobs: commit: %w", err)
 	}
 	return jobs, nil
 }
@@ -193,37 +273,25 @@ var ErrStaleClaim = errors.New("store: claim is no longer held")
 // CompleteJob marks a running job succeeded, but only if claimedBy still
 // matches the row's claimed_by. See ErrStaleClaim.
 func (s *Store) CompleteJob(ctx context.Context, id pgtype.UUID, claimedBy string) error {
-	tag, err := s.pool.Exec(ctx, `
+	return mutateAndNotify(ctx, s.pool, id, string(StatusSucceeded), `
 		UPDATE jobs
 		SET status = 'succeeded', updated_at = now()
-		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'
+		RETURNING queue`,
 		id, claimedBy,
 	)
-	if err != nil {
-		return fmt.Errorf("store: complete job: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrStaleClaim
-	}
-	return nil
 }
 
 // MarkDead moves a running job straight to the dead-letter state, but only
 // if claimedBy still matches the row's claimed_by. See ErrStaleClaim.
 func (s *Store) MarkDead(ctx context.Context, id pgtype.UUID, claimedBy, cause string) error {
-	tag, err := s.pool.Exec(ctx, `
+	return mutateAndNotify(ctx, s.pool, id, string(StatusDead), `
 		UPDATE jobs
 		SET status = 'dead', last_error = $3, claimed_by = NULL, claimed_at = NULL, updated_at = now()
-		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'
+		RETURNING queue`,
 		id, claimedBy, cause,
 	)
-	if err != nil {
-		return fmt.Errorf("store: mark dead: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrStaleClaim
-	}
-	return nil
 }
 
 // ReleaseJob returns a running job to pending immediately (run_at = now()),
@@ -238,20 +306,14 @@ func (s *Store) MarkDead(ctx context.Context, id pgtype.UUID, claimedBy, cause s
 // idle, so making the job immediately claimable again is strictly better
 // than making it wait.
 func (s *Store) ReleaseJob(ctx context.Context, id pgtype.UUID, claimedBy string) error {
-	tag, err := s.pool.Exec(ctx, `
+	return mutateAndNotify(ctx, s.pool, id, string(StatusPending), `
 		UPDATE jobs
 		SET status = 'pending', run_at = now(),
 			claimed_by = NULL, claimed_at = NULL, updated_at = now()
-		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'
+		RETURNING queue`,
 		id, claimedBy,
 	)
-	if err != nil {
-		return fmt.Errorf("store: release job: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrStaleClaim
-	}
-	return nil
 }
 
 // MarkFailedForRetry returns a running job to pending with a future run_at,
@@ -260,18 +322,45 @@ func (s *Store) ReleaseJob(ctx context.Context, id pgtype.UUID, claimedBy string
 // queue.Backoff - since it needs the job's already-known attempts count,
 // which the claim step already returned.
 func (s *Store) MarkFailedForRetry(ctx context.Context, id pgtype.UUID, claimedBy, cause string, runAt time.Time) error {
-	tag, err := s.pool.Exec(ctx, `
+	return mutateAndNotify(ctx, s.pool, id, string(StatusPending), `
 		UPDATE jobs
 		SET status = 'pending', last_error = $3, run_at = $4,
 			claimed_by = NULL, claimed_at = NULL, updated_at = now()
-		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'
+		RETURNING queue`,
 		id, claimedBy, cause, runAt,
 	)
+}
+
+// mutateAndNotify runs a single-row UPDATE...RETURNING queue statement
+// (sql, args) and, if it matched a row, publishes a job_events
+// notification for it in the same transaction before committing. Every
+// caller here targets exactly one job by id and is fenced by claimed_by in
+// its own WHERE clause, so "matched no row" always means ErrStaleClaim,
+// never an id that doesn't exist at all (GetJob is what surfaces that
+// distinction; these are all writes against a job a caller just claimed).
+func mutateAndNotify(ctx context.Context, pool *pgxpool.Pool, id pgtype.UUID, newStatus, sql string, args ...any) error {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("store: mark failed for retry: %w", err)
+		return fmt.Errorf("store: begin: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	var queue string
+	err = tx.QueryRow(ctx, sql, args...).Scan(&queue)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrStaleClaim
+	}
+	if err != nil {
+		return fmt.Errorf("store: update: %w", err)
+	}
+
+	if err := notifyJobEvent(ctx, tx, id.String(), newStatus, queue); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit: %w", err)
 	}
 	return nil
 }
