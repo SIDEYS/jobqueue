@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/queue"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
@@ -149,7 +150,13 @@ func (p *Pool) execute(job *store.Job) {
 	jobCtx, cancel := context.WithTimeout(context.Background(), p.cfg.JobTimeout)
 	defer cancel()
 
+	// Measured here, not inferred from row timestamps: this is the only
+	// place that knows exactly when the handler itself started and ended,
+	// independent of claim or write latency either side of it.
+	start := time.Now()
 	err := handler(jobCtx, job.Payload)
+	metrics.RecordJobDuration(job.Queue, job.JobType, time.Since(start))
+
 	p.report(job, err)
 }
 

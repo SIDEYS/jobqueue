@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
@@ -88,6 +89,10 @@ func (sc *Scheduler) runOne(ctx context.Context, s *store.Schedule, now time.Tim
 		return
 	}
 
+	// RunSchedule bypasses queue.Enqueue entirely (it's a store-level
+	// transaction, not a per-job domain call), so this is also where a
+	// scheduler-fired job's enqueued metric gets recorded - nothing else
+	// sees this write to record it otherwise.
 	_, ran, err := sc.store.RunSchedule(ctx, s.ID, next, store.ScheduledJobParams{
 		Queue:       s.Queue,
 		JobType:     s.JobType,
@@ -100,6 +105,7 @@ func (sc *Scheduler) runOne(ctx context.Context, s *store.Schedule, now time.Tim
 		return
 	}
 	if ran {
+		metrics.RecordEnqueued(s.Queue, s.JobType)
 		log.Printf("scheduler: fired schedule %s, next run %s", s.ID.String(), next)
 	}
 }

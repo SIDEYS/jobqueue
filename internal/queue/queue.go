@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
@@ -70,7 +71,7 @@ func (q *Queue) Enqueue(ctx context.Context, p EnqueueParams) (job *store.Job, i
 	if p.MaxAttempts == 0 {
 		p.MaxAttempts = DefaultMaxAttempts
 	}
-	return q.store.InsertJob(ctx, store.InsertJobParams{
+	job, inserted, err = q.store.InsertJob(ctx, store.InsertJobParams{
 		Queue:          p.Queue,
 		JobType:        p.JobType,
 		Payload:        p.Payload,
@@ -79,6 +80,10 @@ func (q *Queue) Enqueue(ctx context.Context, p EnqueueParams) (job *store.Job, i
 		MaxAttempts:    p.MaxAttempts,
 		IdempotencyKey: p.IdempotencyKey,
 	})
+	if err == nil && inserted {
+		metrics.RecordEnqueued(job.Queue, job.JobType)
+	}
+	return job, inserted, err
 }
 
 func (q *Queue) Get(ctx context.Context, id pgtype.UUID) (*store.Job, error) {
@@ -88,7 +93,16 @@ func (q *Queue) Get(ctx context.Context, id pgtype.UUID) (*store.Job, error) {
 // Claim atomically hands up to limit pending jobs in queue to workerID. See
 // store.ClaimJobs for why this is safe under concurrent callers.
 func (q *Queue) Claim(ctx context.Context, queueName string, limit int, workerID string) ([]*store.Job, error) {
-	return q.store.ClaimJobs(ctx, queueName, limit, workerID)
+	jobs, err := q.store.ClaimJobs(ctx, queueName, limit, workerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range jobs {
+		if j.ClaimedAt != nil {
+			metrics.RecordQueueWait(j.Queue, j.JobType, j.ClaimedAt.Sub(j.RunAt))
+		}
+	}
+	return jobs, nil
 }
 
 // Complete marks a claimed job succeeded. job must be a row returned by
@@ -100,7 +114,11 @@ func (q *Queue) Complete(ctx context.Context, job *store.Job) error {
 	if err != nil {
 		return err
 	}
-	return q.store.CompleteJob(ctx, job.ID, claimedBy)
+	if err := q.store.CompleteJob(ctx, job.ID, claimedBy); err != nil {
+		return err
+	}
+	metrics.RecordSucceeded(job.Queue, job.JobType)
+	return nil
 }
 
 // Fail records that a claimed job's handler returned cause, and decides
@@ -115,14 +133,23 @@ func (q *Queue) Fail(ctx context.Context, job *store.Job, cause error) error {
 	}
 
 	if job.Attempts >= job.MaxAttempts {
-		return q.store.MarkDead(ctx, job.ID, claimedBy, cause.Error())
+		if err := q.store.MarkDead(ctx, job.ID, claimedBy, cause.Error()); err != nil {
+			return err
+		}
+		metrics.RecordFailed(job.Queue, job.JobType)
+		metrics.RecordDead(job.Queue, job.JobType)
+		return nil
 	}
 
 	q.rngMu.Lock()
 	delay := Backoff(int(job.Attempts), q.rng)
 	q.rngMu.Unlock()
 
-	return q.store.MarkFailedForRetry(ctx, job.ID, claimedBy, cause.Error(), time.Now().Add(delay))
+	if err := q.store.MarkFailedForRetry(ctx, job.ID, claimedBy, cause.Error(), time.Now().Add(delay)); err != nil {
+		return err
+	}
+	metrics.RecordFailed(job.Queue, job.JobType)
+	return nil
 }
 
 // Release hands a claimed job back immediately, without charging it an

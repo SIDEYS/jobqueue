@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/SIDEYS/jobqueue/internal/metrics"
 	"github.com/SIDEYS/jobqueue/internal/store"
 )
 
@@ -53,8 +54,21 @@ func (r *Reaper) Threshold() time.Time {
 
 // ReclaimOnce runs a single reclaim pass. See store.ReclaimStale for what
 // happens to each reclaimed job.
+//
+// This bypasses queue.Fail entirely (it's a bulk store-level operation,
+// not a per-job domain call), so it's also where reclaim's own dead-letter
+// outcomes get counted - nothing else sees them to record it otherwise.
 func (r *Reaper) ReclaimOnce(ctx context.Context) ([]*store.Job, error) {
-	return r.store.ReclaimStale(ctx, r.Threshold(), r.batchSize)
+	jobs, err := r.store.ReclaimStale(ctx, r.Threshold(), r.batchSize)
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range jobs {
+		if j.Status == store.StatusDead {
+			metrics.RecordDead(j.Queue, j.JobType)
+		}
+	}
+	return jobs, nil
 }
 
 // Run calls ReclaimOnce every interval until ctx is cancelled.
