@@ -139,6 +139,60 @@ schedules) so the deployed dashboard is never an empty read against an
 idle system. It's a no-op if the `jobs` table already has any rows, so
 it's safe to run on every boot rather than needing a one-time setup step.
 
+## Deploy
+
+One Docker image (`Dockerfile`), three Fly.io process groups against it
+(`fly.toml`): `api` serves HTTP (REST, the embedded dashboard,
+`/healthz`/`/readyz`/`/metrics`), `worker` and `scheduler` are headless.
+Postgres is external - Neon or Supabase's free tier, not Fly Postgres -
+so the database survives independently of the app and there's no volume
+to manage.
+
+**One-time setup:**
+
+1. Create a Postgres database on [Neon](https://neon.tech) or
+   [Supabase](https://supabase.com) and copy its connection string
+   (`postgres://...?sslmode=require` - the managed providers require TLS,
+   unlike the local `docker-compose` Postgres).
+2. Install and authenticate `flyctl`:
+   ```
+   brew install flyctl
+   flyctl auth login
+   ```
+3. Reserve the app name from `fly.toml` (edit the `app` field first if
+   `jobqueue-sideys` is already taken - Fly app names are globally unique):
+   ```
+   fly apps create jobqueue-sideys
+   ```
+4. Set the database connection as a secret - never committed, never in
+   `fly.toml`:
+   ```
+   fly secrets set DATABASE_URL="postgres://...?sslmode=require"
+   ```
+
+**Deploy:**
+
+```
+fly deploy
+```
+
+This builds the image from `Dockerfile`, runs `cmd/seed` as the release
+command (a no-op after the first deploy - see the Dashboard section
+above), and starts all three process groups. Confirm it's healthy:
+
+```
+fly status
+curl https://jobqueue-sideys.fly.dev/healthz
+```
+
+The dashboard is at the app's root URL - no separate frontend deploy or
+CORS configuration needed, since `cmd/api` serves it directly (embedded
+via `web/embed.go`, see the Dashboard section).
+
+**Redeploying** after further changes is just `fly deploy` again - the
+release command re-runs (still a no-op once seeded) and Fly does a
+rolling restart of all three process groups.
+
 ## Limitations and tradeoffs so far
 
 - **Polling, not push.** Workers poll for work at `WORKER_POLL_INTERVAL`,
