@@ -1,0 +1,61 @@
+# One Fly app, three process groups sharing the single image built by the
+# Dockerfile - api serves HTTP (REST + dashboard + health/metrics), worker
+# and scheduler are headless. Simpler to operate and reason about than
+# three separate Fly apps for a portfolio-scale deployment.
+#
+# DATABASE_URL is deliberately not set here - it's a secret
+# (`fly secrets set DATABASE_URL=...`), pointing at an external managed
+# Postgres (Neon/Supabase), not Fly Postgres. See the README's Deploy
+# section for the exact setup sequence.
+app = "jobqueue-sideys"
+primary_region = "iad"
+
+# WORKER_DRAIN_TIMEOUT (25s, .env.example) must stay shorter than this
+# with margin for the release write itself - see the README's Reliability
+# section. This is app-wide (Fly's kill_timeout doesn't vary by process
+# group), which only means api/scheduler get a longer-than-necessary
+# grace period on shutdown - harmless, since neither holds in-flight work
+# that needs draining the way the worker does.
+kill_timeout = "30s"
+
+[build]
+
+[env]
+LOG_LEVEL = "info"
+
+[processes]
+api = "jq-api"
+worker = "jq-worker"
+scheduler = "jq-scheduler"
+
+[deploy]
+# Runs once before each new version goes live. Migrations already run
+# automatically on every binary's own startup (internal/store.Migrate),
+# so this only needs to seed - and cmd/seed is itself a no-op once the
+# jobs table has any rows, so it's safe to run on every single deploy,
+# not just the first.
+release_command = "/usr/local/bin/jq-seed"
+
+[http_service]
+processes = ["api"]
+internal_port = 8080
+force_https = true
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 1
+
+# Gates whether a machine receives traffic - points at /readyz (not
+# /healthz) deliberately, since routing traffic to a machine that's up
+# but can't reach the database would just produce 500s instead of Fly
+# trying another machine or waiting.
+[[http_service.checks]]
+interval = "10s"
+timeout = "2s"
+grace_period = "10s"
+method = "GET"
+path = "/readyz"
+
+[[vm]]
+processes = ["api", "worker", "scheduler"]
+size = "shared-cpu-1x"
+memory = "256mb"
