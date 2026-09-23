@@ -50,5 +50,7 @@ func NewRouter(q *queue.Queue, s *store.Store, hub *events.Hub, log *slog.Logger
 		r.Delete("/schedules/{id}", a.deleteSchedule)
 	})
 
+	r.Get("/*", a.dashboard())
+
 	return r
 }

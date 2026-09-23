@@ -9,7 +9,12 @@ coverage.txt
 
 # Node / web
 web/node_modules/
-web/dist/
+# dist/ is real build output (npm run build), gitignored except for a
+# committed placeholder index.html - //go:embed requires the directory to
+# be non-empty at `go build` time, and cmd/api falls back to serving that
+# placeholder when the real dashboard hasn't been built (see web/embed.go).
+web/dist/*
+!web/dist/index.html
 
 # OS
 .DS_Store
