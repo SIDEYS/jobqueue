@@ -1,0 +1,9 @@
+.git
+web/node_modules
+# The go-builder stage overwrites this with the web-builder stage's real
+# output regardless (see Dockerfile), so the committed placeholder never
+# needs to survive into the build context.
+web/dist
+loadtest
+docs
+*.md
